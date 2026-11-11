@@ -103,13 +103,32 @@ func IsapiModify(opts IsapiOptions) (reply string, ok bool, err error) {
 		status, reply, err = isapiDo(client, http.MethodPut, base+uri, patched, opts)
 	}
 	if err != nil {
-		return reply, false, err
+		return reply, false, friendlyModifyError(reply, err, opts)
 	}
-	if status.StatusValue != 1 {
+	switch {
+	case status.StatusValue == 1:
+		// 完全成功
+	case status.StatusValue == 7:
+		// rebootRequired：配置已接受，网络接口重启后生效
+		log.Printf("[isapi] 配置已接受，设备网络接口重启中")
+	default:
 		return reply, false, fmt.Errorf("设备返回 %d %s（%s）",
 			status.StatusValue, status.StatusStr, status.SubStatusCode)
 	}
 	return reply, true, nil
+}
+
+// friendlyModifyError 把设备侧的已知拒绝翻译成可操作的提示。
+func friendlyModifyError(reply string, err error, opts IsapiOptions) error {
+	low := strings.ToLower(reply)
+	switch {
+	case opts.DHCP && strings.Contains(low, "network address type error"):
+		return errors.New("设备拒绝了 DHCP 切换：该固件（安全加固型，如 iDS 系列）硬禁用了 DHCP，" +
+			"仅支持静态地址；如需 DHCP 请先在设备 Web 管理台确认该选项是否可用")
+	case strings.Contains(low, "user is locked"):
+		return errors.New("设备已锁定（密码连续错误触发防暴力破解），请稍后再试或重启设备解锁")
+	}
+	return err
 }
 
 // IsapiGetNetwork 读取设备当前网络配置（寻址方式/IP/掩码/网关）。
