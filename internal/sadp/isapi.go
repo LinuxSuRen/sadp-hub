@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"regexp"
 	"strings"
@@ -18,6 +19,7 @@ import (
 // 适用新型号固件（SADP Encrypt=true），需要知道设备密码。
 type IsapiOptions struct {
 	DeviceIP string
+	MAC      string // 设备 MAC：IPv4 跨网段不通时用于推导 IPv6 链路本地地址自动回退
 	HTTPPort int
 	Username string
 	Password string
@@ -53,9 +55,11 @@ type isapiNetworkInterface struct {
 
 // IsapiModify 修改设备网络参数（read-before-write）。
 // DHCP=false 写静态地址（新 IP/掩码/网关）；DHCP=true 仅切换寻址方式为 DHCP。
+// IPv4 跨网段不可达时，自动经 MAC 推导的 IPv6 链路本地地址回退（同二层即可用）。
 func IsapiModify(opts IsapiOptions) (reply string, ok bool, err error) {
-	if opts.DeviceIP == "" {
-		return "", false, errors.New("DeviceIP 必填")
+	opts.DeviceIP, err = resolveDeviceAddr(opts)
+	if err != nil {
+		return "", false, err
 	}
 	if !opts.DHCP && opts.NewIP == "" {
 		return "", false, errors.New("NewIP 必填（静态模式）")
@@ -109,10 +113,13 @@ func IsapiModify(opts IsapiOptions) (reply string, ok bool, err error) {
 }
 
 // IsapiGetNetwork 读取设备当前网络配置（寻址方式/IP/掩码/网关）。
+// IPv4 跨网段不可达时，自动经 MAC 推导的 IPv6 链路本地地址回退。
 func IsapiGetNetwork(opts IsapiOptions) (*isapiNetworkInterface, error) {
-	if opts.DeviceIP == "" {
-		return nil, errors.New("DeviceIP 必填")
+	addr, err := resolveDeviceAddr(opts)
+	if err != nil {
+		return nil, err
 	}
+	opts.DeviceIP = addr
 	if opts.Timeout <= 0 {
 		opts.Timeout = 10 * time.Second
 	}
@@ -128,6 +135,88 @@ func IsapiGetNetwork(opts IsapiOptions) (*isapiNetworkInterface, error) {
 		Transport: &http.Transport{Proxy: nil},
 	}
 	return isapiGet(client, fmt.Sprintf("http://%s:%d", wrapIP6(opts.DeviceIP), opts.HTTPPort), opts)
+}
+
+// resolveDeviceAddr 解析设备可达地址：先试指定 IPv4，超时/不可达时
+// 用 MAC 推导 IPv6 链路本地地址（EUI-64），逐网卡 zone 探测（同二层即可达）。
+func resolveDeviceAddr(opts IsapiOptions) (string, error) {
+	if opts.DeviceIP == "" {
+		return "", errors.New("DeviceIP 必填")
+	}
+	probeTimeout := opts.Timeout
+	if probeTimeout <= 0 {
+		probeTimeout = 10 * time.Second
+	}
+	quick := &http.Client{
+		Timeout:   4 * time.Second,
+		Transport: &http.Transport{Proxy: nil},
+	}
+	probe := func(addr string) bool {
+		base := fmt.Sprintf("http://%s:%d", wrapIP6(addr), opts.HTTPPort)
+		req, err := http.NewRequest(http.MethodGet, base+"/ISAPI/System/Deviceinfo", nil)
+		if err != nil {
+			return false
+		}
+		resp, err := quick.Do(req)
+		if err != nil {
+			return false
+		}
+		_ = resp.Body.Close()
+		// 任何 HTTP 应答（含 401/404）都证明地址可达
+		return true
+	}
+
+	if probe(opts.DeviceIP) {
+		return opts.DeviceIP, nil
+	}
+	log.Printf("[isapi] %s 不可达，尝试 MAC 推导的 IPv6 链路本地地址", opts.DeviceIP)
+	for _, cand := range linkLocalCandidates(opts.MAC) {
+		if probe(cand) {
+			log.Printf("[isapi] 经链路本地地址可达: %s", cand)
+			return cand, nil
+		}
+	}
+	return "", fmt.Errorf("设备 %s 不可达（IPv4 超时，且无同二层链路本地 IPv6；跨网段且非同二层时请先调整本机网络）", opts.DeviceIP)
+}
+
+// linkLocalCandidates 由 MAC（EUI-64）推导设备的 IPv6 链路本地地址，
+// 返回带本机各网卡 zone（接口序号）的候选列表。
+func linkLocalCandidates(mac string) []string {
+	hexOnly := strings.Map(func(r rune) rune {
+		switch {
+		case r >= '0' && r <= '9', r >= 'a' && r <= 'f', r >= 'A' && r <= 'F':
+			return r
+		}
+		return -1
+	}, mac)
+	if len(hexOnly) != 12 {
+		return nil
+	}
+	b, err := hex.DecodeString(hexOnly)
+	if err != nil {
+		return nil
+	}
+	// EUI-64：中间插 ff:fe，U/L 位取反
+	eui := make([]byte, 8)
+	copy(eui[:3], b[:3])
+	eui[3], eui[4] = 0xff, 0xfe
+	copy(eui[5:], b[3:])
+	eui[0] ^= 0x02
+	addr := fmt.Sprintf("fe80::%02x%02x:%02x%02x:%02x%02x:%02x%02x",
+		eui[0], eui[1], eui[2], eui[3], eui[4], eui[5], eui[6], eui[7])
+
+	var out []string
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	for _, ifc := range ifaces {
+		if ifc.Flags&net.FlagUp == 0 {
+			continue
+		}
+		out = append(out, fmt.Sprintf("%s%%%d", addr, ifc.Index))
+	}
+	return out
 }
 
 // wrapIP6 IPv6 地址作为 URL host 时需要方括号包裹，链路本地地址的 zone（%iface）需转义为 %25。
@@ -148,20 +237,25 @@ func isapiGetRaw(client *http.Client, base string, opts IsapiOptions) (string, e
 }
 
 // patchNetworkXML 在设备返回的原文上做最小替换：只改寻址方式与（静态时的）地址字段。
+// 注意：只替换首个匹配（<ipAddress> 在 DNS/网关等处也会出现，不能全局替换）；
+// 网关的真实结构是 <DefaultGateway><ipAddress>，需定向匹配。
 func patchNetworkXML(raw string, opts IsapiOptions) (string, error) {
-	set := func(re, val, name string) (string, error) {
+	// setFirst 把正则第 2 个捕获组（字段值）替换为 val，其余原文保持不动
+	setFirst := func(raw, re, val, name string) (string, error) {
 		r, err := regexp.Compile(re)
 		if err != nil {
 			return "", err
 		}
-		if !r.MatchString(raw) {
+		sub := r.FindStringSubmatchIndex(raw)
+		if sub == nil || len(sub) < 8 {
 			return "", fmt.Errorf("设备应答中未找到 <%s> 字段", name)
 		}
-		return r.ReplaceAllString(raw, "${1}"+val+"${3}"), nil
+		// sub[4]:sub[5] 是第 2 个捕获组（字段值）的起止
+		return raw[:sub[4]] + val + raw[sub[5]:], nil
 	}
 
 	if opts.DHCP {
-		out, err := set(`(<addressingType>)([^<]*)(</addressingType>)`, "dhcp", "addressingType")
+		out, err := setFirst(raw, `(<addressingType>)([^<]*)(</addressingType>)`, "dhcp", "addressingType")
 		if err != nil {
 			return "", err
 		}
@@ -171,21 +265,21 @@ func patchNetworkXML(raw string, opts IsapiOptions) (string, error) {
 	out := raw
 	var err error
 	if opts.NewIP != "" {
-		if out, err = set(`(<ipAddress>)([^<]*)(</ipAddress>)`, opts.NewIP, "ipAddress"); err != nil {
+		if out, err = setFirst(out, `(<ipAddress>)([^<]*)(</ipAddress>)`, opts.NewIP, "ipAddress"); err != nil {
 			return "", err
 		}
 	}
 	if opts.NetMask != "" {
-		if out, err = set(`(<subnetMask>)([^<]*)(</subnetMask>)`, opts.NetMask, "subnetMask"); err != nil {
+		if out, err = setFirst(out, `(<subnetMask>)([^<]*)(</subnetMask>)`, opts.NetMask, "subnetMask"); err != nil {
 			return "", err
 		}
 	}
 	if opts.Gateway != "" {
-		if out, err = set(`(<ipv4Address>)([^<]*)(</ipv4Address>)`, opts.Gateway, "ipv4Address"); err != nil {
+		if out, err = setFirst(out, `(<DefaultGateway>\s*<ipAddress>)([^<]*)(</ipAddress>)`, opts.Gateway, "DefaultGateway/ipAddress"); err != nil {
 			return "", err
 		}
 	}
-	if out, err = set(`(<addressingType>)([^<]*)(</addressingType>)`, "static", "addressingType"); err != nil {
+	if out, err = setFirst(out, `(<addressingType>)([^<]*)(</addressingType>)`, "static", "addressingType"); err != nil {
 		return "", err
 	}
 	return out, nil
@@ -209,6 +303,9 @@ func isapiDo(client *http.Client, method, url, body string, opts IsapiOptions) (
 	if err != nil {
 		return nil, "", err
 	}
+	if body != "" {
+		req.Header.Set("Content-Type", "application/xml")
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, "", err
@@ -226,6 +323,9 @@ func isapiDo(client *http.Client, method, url, body string, opts IsapiOptions) (
 		}
 		req2, _ := http.NewRequest(method, url, strings.NewReader(body))
 		req2.Header.Set("Authorization", auth)
+		if body != "" {
+			req2.Header.Set("Content-Type", "application/xml")
+		}
 		resp2, err := client.Do(req2)
 		if err != nil {
 			return nil, "", err

@@ -134,7 +134,7 @@ func (s *Server) modify(w http.ResponseWriter, r *http.Request) {
 		})
 	} else {
 		reply, _, err = sadp.IsapiModify(sadp.IsapiOptions{
-			DeviceIP: req.DeviceIP, HTTPPort: req.HTTPPort,
+			DeviceIP: req.DeviceIP, MAC: req.MAC, HTTPPort: req.HTTPPort,
 			Username: req.Username, Password: req.Password,
 			NewIP: req.NewIP, NetMask: req.NetMask, Gateway: req.Gateway,
 			DHCP:    req.DHCP,
@@ -152,6 +152,7 @@ func (s *Server) modify(w http.ResponseWriter, r *http.Request) {
 func (s *Server) deviceNet(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		DeviceIP string `json:"deviceIp"`
+		MAC      string `json:"mac"`
 		HTTPPort int    `json:"httpPort"`
 		Username string `json:"username"`
 		Password string `json:"password"`
@@ -161,7 +162,7 @@ func (s *Server) deviceNet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ifc, err := sadp.IsapiGetNetwork(sadp.IsapiOptions{
-		DeviceIP: req.DeviceIP, HTTPPort: req.HTTPPort,
+		DeviceIP: req.DeviceIP, MAC: req.MAC, HTTPPort: req.HTTPPort,
 		Username: req.Username, Password: req.Password,
 		Timeout: 10 * time.Second,
 	})
