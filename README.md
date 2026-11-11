@@ -54,6 +54,25 @@ curl -X POST http://localhost:8080/api/scan \
 
 > 组播发现层无鉴权、仅暴露设备标识（序列号/MAC/IP），与 SADP 的发现层思路一致；敏感操作请走独立鉴权通道。
 
+## 发布
+
+打 tag 即自动发布（[release.yml](.github/workflows/release.yml)）：
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+- **GitHub Release**：goreleaser 构建 linux/windows/darwin × amd64/arm64 二进制（tar.gz/zip + checksums），版本号注入 `-version`
+- **容器镜像**：buildx 多架构（linux/amd64、linux/arm64）推送 GHCR `ghcr.io/linuxsuren/sadp-hub:<版本>` 与 `:latest`
+
+Docker 部署（组播发现建议 host 网络，bridge 下只能发现容器所在网络）：
+
+```bash
+docker compose up -d
+# 或
+docker run -d -p 8080:8080 --network host ghcr.io/linuxsuren/sadp-hub:latest
+```
+
 ## Windows 实测陷阱（发现链路三个坑）
 
 | 现象 | 根因与解法 |

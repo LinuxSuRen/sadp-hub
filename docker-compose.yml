@@ -1,0 +1,9 @@
+services:
+  sadp-hub:
+    image: ghcr.io/linuxsuren/sadp-hub:latest
+    container_name: sadp-hub
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    # 组播发现需要 host 网络才能覆盖所有物理网卡（bridge 下只能发现容器所在网络）
+    network_mode: host
