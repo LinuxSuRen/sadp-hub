@@ -5,10 +5,10 @@ import (
 	"encoding/hex"
 	"encoding/xml"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
-	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -96,7 +96,7 @@ func IsapiModify(opts IsapiOptions) (reply string, ok bool, err error) {
 	status, reply, err := isapiDo(client, http.MethodPut, base+uri, patched, opts)
 	if err != nil && strings.Contains(strings.ToLower(reply), "not support") {
 		uri = "/ISAPI/System/Network/IPAddress"
-		status, reply, err = isapiDo(client, http.MethodPut, base+uri, string(body), opts)
+		status, reply, err = isapiDo(client, http.MethodPut, base+uri, patched, opts)
 	}
 	if err != nil {
 		return reply, false, err
